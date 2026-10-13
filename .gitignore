@@ -1,1 +1,5 @@
 data/cup-01
+.venv/
+out/
+__pycache__/
+*.pyc

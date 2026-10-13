@@ -1,0 +1,6 @@
+# Data loading
+huggingface_hub>=0.34
+pyarrow>=17
+numpy>=1.26
+av>=14            # PyAV: bundles FFmpeg with AV1 decoding (dataset videos are AV1)
+pillow>=10
