@@ -29,21 +29,39 @@ DISTRACTOR_NOUNS = ["bowl", "cup", "plate", "mug", "box", "container", "bottle"]
 
 
 class AttributeScorer:
-    def __init__(self, model_id: str = DEFAULT_SIGLIP, device: torch.device | None = None):
+    def __init__(self, model_id: str = DEFAULT_SIGLIP, device: torch.device | None = None,
+                 dtype: torch.dtype | None = None):
         self.device = device or get_device()
+        # fp16 picks the same best phrase as fp32 on every crop we checked, at 3-10x the speed.
+        self.dtype = dtype or (torch.float16 if self.device.type in ("cuda", "mps") else torch.float32)
         self.processor = AutoProcessor.from_pretrained(model_id)
-        self.model = AutoModel.from_pretrained(model_id).to(self.device).eval()
+        self.model = AutoModel.from_pretrained(model_id, dtype=self.dtype).to(self.device).eval()
+        self._text_cache: dict[tuple[str, ...], torch.Tensor] = {}
 
     @torch.no_grad()
     def __call__(self, crops: list[Image.Image], phrases: list[str]) -> np.ndarray:
-        """(len(crops), len(phrases)) sigmoid match scores in [0, 1]."""
+        """(len(crops), len(phrases)) sigmoid match scores in [0, 1].
+
+        Same computation as the model's forward pass (normalized embeddings, cosine × scale +
+        bias, sigmoid), split so phrase embeddings are computed once per phrase list: the
+        phrases are fixed for a run while crops change every frame.
+        """
         if not crops or not phrases:
             return np.zeros((len(crops), len(phrases)))
-        texts = [PROMPT_TEMPLATE.format(p) for p in phrases]
-        inputs = self.processor(
-            text=texts, images=crops, padding="max_length", max_length=64, return_tensors="pt"
-        ).to(self.device)
-        return torch.sigmoid(self.model(**inputs).logits_per_image).float().cpu().numpy()
+        text = self._text_embeddings(tuple(phrases))
+        pixels = self.processor(images=crops, return_tensors="pt")["pixel_values"].to(self.device, self.dtype)
+        image = self.model.vision_model(pixel_values=pixels).pooler_output
+        image = image / image.norm(dim=-1, keepdim=True)
+        logits = image @ text.T * self.model.logit_scale.exp() + self.model.logit_bias
+        return torch.sigmoid(logits).float().cpu().numpy()
+
+    def _text_embeddings(self, phrases: tuple[str, ...]) -> torch.Tensor:
+        if phrases not in self._text_cache:
+            tokens = self.processor(text=[PROMPT_TEMPLATE.format(p) for p in phrases],
+                                    padding="max_length", max_length=64, return_tensors="pt").to(self.device)
+            text = self.model.text_model(input_ids=tokens["input_ids"]).pooler_output
+            self._text_cache[phrases] = text / text.norm(dim=-1, keepdim=True)
+        return self._text_cache[phrases]
 
 
 def masked_crop(image: np.ndarray, mask: np.ndarray, pad: float = 0.15, background: int = 128) -> Image.Image:
