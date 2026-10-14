@@ -9,5 +9,10 @@ pillow>=10
 spacy>=3.8,<3.9
 en_core_web_sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl
 
+# Models: Grounding DINO, SAM 2, SigLIP 2 (all via transformers), Hungarian matching
+torch>=2.4
+transformers>=4.56
+scipy>=1.11
+
 # Tests
 pytest>=8
