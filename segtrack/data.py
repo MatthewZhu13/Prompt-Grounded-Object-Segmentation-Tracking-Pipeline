@@ -25,19 +25,21 @@ VIDEO_KEY_PREFIX = "observation.images."
 
 @dataclass(frozen=True)
 class VideoSegment:
-    """Where one camera's footage for an episode lives."""
+    """One camera's footage for one episode"""
 
     path: Path          # local path to the MP4 (may contain other episodes too)
-    from_ts: float      # episode start within the MP4, seconds
-    to_ts: float        # episode end (exclusive), seconds
+    from_ts: float      # episode start within the MP4
+    to_ts: float        # episode end (exclusive)
 
 
 @dataclass(frozen=True)
 class Episode:
-    index: int
-    length: int                         # number of frames
+    """Encapsulates multiple VideoSegments"""
+
+    index: int                          # epusode number
+    length: int                         # num frames
     fps: float
-    cameras: dict[str, VideoSegment]    # e.g. {"top": ..., "left": ..., "right": ...}
+    cameras: dict[str, VideoSegment]    # {"top": VideoSegment "left": VideoSegment "right": VideoSegment
 
 
 @dataclass(frozen=True)
@@ -45,7 +47,7 @@ class FrameChunk:
     """A contiguous run of decoded frames from one camera."""
 
     frame_indices: np.ndarray   # (N,) int, episode-relative, matches the dataset's frame_index
-    frames: np.ndarray          # (N, H, W, 3) uint8 RGB
+    frames: np.ndarray          # (num frames, frame height, W, RGB) uint8 RGB
 
 
 class Dataset:
@@ -66,7 +68,11 @@ class Dataset:
     # ---------- file access ----------
 
     def _fetch(self, rel_path: str) -> Path:
-        """Return a local path for a dataset file, downloading it if not present locally."""
+        """
+        If present return a local path for a dataset file
+        Else download
+        """
+
         if self.data_dir is not None:
             local = self.data_dir / rel_path
             if local.exists():
@@ -109,6 +115,7 @@ class Dataset:
 
     def episode(self, index: int, cameras: list[str] | None = None) -> Episode:
         """Resolve an episode's video files (downloading them if needed) and time ranges."""
+
         rows = self._load_episode_rows()
         if index not in rows:
             raise ValueError(f"episode {index} not in dataset (has {len(rows)} episodes)")
@@ -139,9 +146,11 @@ class Dataset:
             table = pq.read_table(self._fetch("meta/tasks_annotated.parquet"))
         except Exception:
             return None
+        
         for row in table.to_pylist():
             if row.get("episode_index") == index:
                 return row["task"]
+            
         return None
 
 
@@ -202,6 +211,7 @@ def _main() -> None:
     p.add_argument("--num-samples", type=int, default=5)
     args = p.parse_args()
 
+    # retrieve episode 0 from cup-01 dir
     ds = Dataset(data_dir=args.data_dir)
     ep = ds.episode(args.episode)
     print(f"episode {ep.index}: {ep.length} frames @ {ep.fps} fps, cameras {list(ep.cameras)}")

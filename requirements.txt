@@ -4,3 +4,10 @@ pyarrow>=17
 numpy>=1.26
 av>=14            # PyAV: bundles FFmpeg with AV1 decoding (dataset videos are AV1)
 pillow>=10
+
+# Task parsing
+spacy>=3.8,<3.9
+en_core_web_sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl
+
+# Tests
+pytest>=8
