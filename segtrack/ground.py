@@ -115,6 +115,8 @@ class FrameGrounder:
         """Indices of candidates to keep: drops empty masks, and masks lying mostly inside a
         larger mask with the same best noun (a cup's rim inside the cup). Different nouns are
         kept, so a spoon resting in a bowl survives."""
+        if len(masks) == 0:
+            return np.zeros(0, dtype=int)
         areas = masks.reshape(len(masks), -1).sum(1)
         keep = areas > 0
         if len(masks) > 1:
