@@ -19,21 +19,19 @@ See [`report.md`](report.md) for runtime and failure modes with frame references
 ---
 ## Demos
 
-
-https://github.com/user-attachments/assets/b2369af3-c710-4980-a1dd-92f5b0bdf222
-
-https://github.com/user-attachments/assets/f0ff011b-1d1a-4805-892e-76abb81e5bb7
-
-https://github.com/user-attachments/assets/c76b8a71-5cb2-45d5-964d-52754e39a71a
-
-
+### Episode 0 -- most accurate
 https://github.com/user-attachments/assets/b43f0f12-477e-40e9-918e-bd707640dc89
 
 https://github.com/user-attachments/assets/1acb5280-675c-4980-b919-cdf1d4760031
 
 https://github.com/user-attachments/assets/020f794a-e098-4ea9-b407-40a1120549bc
 
+### Episode 24 -- less accurate
+https://github.com/user-attachments/assets/b2369af3-c710-4980-a1dd-92f5b0bdf222
 
+https://github.com/user-attachments/assets/f0ff011b-1d1a-4805-892e-76abb81e5bb7
+
+https://github.com/user-attachments/assets/c76b8a71-5cb2-45d5-964d-52754e39a71a
 ---
 
 ## Install
