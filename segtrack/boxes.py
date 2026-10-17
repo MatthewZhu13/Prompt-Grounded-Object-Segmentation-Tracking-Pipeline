@@ -62,6 +62,22 @@ def clean_mask(mask: np.ndarray, keep_largest: bool = False, min_piece: float = 
     return np.isin(labels, keep)
 
 
+def mask_iou(a: np.ndarray, b: np.ndarray) -> float:
+    """Intersection over union of two boolean masks (0 if both are empty)."""
+    union = np.logical_or(a, b).sum()
+    return float(np.logical_and(a, b).sum() / union) if union else 0.0
+
+
+def covered(inner: np.ndarray, outer: np.ndarray) -> float:
+    """Fraction of `inner`'s pixels that lie inside `outer`."""
+    area = inner.sum()
+    return float(np.logical_and(inner, outer).sum() / area) if area else 0.0
+
+
+def touches_edge(mask: np.ndarray) -> bool:
+    return bool(mask[0].any() or mask[-1].any() or mask[:, 0].any() or mask[:, -1].any())
+
+
 def containment(masks: np.ndarray) -> np.ndarray:
     """(N, N) matrix: fraction of mask i's pixels that lie inside mask j."""
     flat = masks.reshape(len(masks), -1).astype(np.float32)

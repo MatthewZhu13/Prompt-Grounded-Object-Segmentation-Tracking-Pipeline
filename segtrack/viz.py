@@ -1,22 +1,29 @@
-"""Drawing helpers: colored masks, boxes and ID labels over frames."""
+"""Drawing helpers: coloured masks, ID tags, a status sidebar, and boxes."""
 
 from __future__ import annotations
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
-# Distinct, colorblind-friendly-ish colors indexed by track ID (ID 1 → PALETTE[0]).
+# Distinct colours indexed by track ID (ID 1 → PALETTE[0]). They identify tracks, not object
+# colours: the "yellow bowl" may well be drawn green.
 PALETTE = [
     (230, 25, 75), (60, 180, 75), (0, 130, 200), (245, 130, 48), (145, 30, 180),
     (70, 240, 240), (240, 50, 230), (210, 245, 60), (0, 128, 128), (170, 110, 40),
 ]
+
+SIDEBAR_WIDTH = 180
+SIDEBAR_BG = (28, 28, 30)
+TEXT = (240, 240, 240)
+MUTED = (140, 140, 145)
+STATE_TEXT = {"tracking": "visible", "lost": "lost", "searching": "not seen yet"}
 
 
 def id_color(track_id: int) -> tuple[int, int, int]:
     return PALETTE[(track_id - 1) % len(PALETTE)]
 
 
-def _font(size: int = 12):
+def _font(size: int):
     try:
         return ImageFont.load_default(size=size)
     except TypeError:                       # Pillow < 10.1
@@ -24,7 +31,7 @@ def _font(size: int = 12):
 
 
 def overlay_masks(frame: np.ndarray, masks: dict[int, np.ndarray], alpha: float = 0.45) -> np.ndarray:
-    """Blend each track's mask over the frame in its ID color."""
+    """Blend each track's mask over the frame in its ID colour."""
     out = frame.astype(np.float32).copy()
     for tid, mask in masks.items():
         if mask is not None and mask.any():
@@ -37,32 +44,69 @@ def annotate_frame(
     masks: dict[int, np.ndarray],
     labels: dict[int, str],
     caption: str | None = None,
-    font_size: int = 12,
+    states: dict[int, str] | None = None,
+    font_size: int = 13,
 ) -> np.ndarray:
-    """Frame with each track's mask filled and outlined in its ID color and labeled "id: name"."""
+    """Frame with each track's mask filled, outlined and tagged "id label".
+
+    With `states` ({track id: tracking | lost | searching}), a sidebar is added to the right
+    listing every target and whether it is visible, with `caption` at its top; the output is
+    then SIDEBAR_WIDTH pixels wider than the frame. Without it, `caption` goes on the frame.
+    """
     from scipy import ndimage
 
     out = overlay_masks(frame, masks)
     for tid, mask in masks.items():
-        edge = mask & ~ndimage.binary_erosion(mask, iterations=2)
-        out[edge] = id_color(tid)
+        out[mask & ~ndimage.binary_erosion(mask, iterations=2)] = id_color(tid)
+
     image = Image.fromarray(out)
     draw = ImageDraw.Draw(image)
     font = _font(font_size)
     for tid, mask in masks.items():
         ys, xs = np.nonzero(mask)
         if len(xs):
-            x, y = float(xs.min()), float(ys.min()) - font_size - 3
-            draw_label(draw, (x, max(y, 0)), f"{tid}: {labels.get(tid, '?')}", id_color(tid), font)
+            draw_tag(draw, (float(xs.min()), float(ys.min()) - font_size - 4), f"{tid} {labels.get(tid, '?')}",
+                     id_color(tid), font, image.width)
+    if states is None:
+        if caption:
+            draw_tag(draw, (4, 4), caption, (0, 0, 0), font, image.width)
+        return np.asarray(image)
+    return np.hstack([np.asarray(image), _sidebar(frame.shape[0], labels, states, caption, font_size)])
+
+
+def _sidebar(height: int, labels: dict[int, str], states: dict[int, str], caption: str | None,
+             font_size: int) -> np.ndarray:
+    """Panel listing every target: colour swatch, "id label", and its state on this frame."""
+    panel = Image.new("RGB", (SIDEBAR_WIDTH, height), SIDEBAR_BG)
+    draw = ImageDraw.Draw(panel)
+    font, small = _font(font_size), _font(font_size - 1)
+    y = 10
     if caption:
-        draw_label(draw, (4, 4), caption, (0, 0, 0), font)
-    return np.asarray(image)
+        draw.text((12, y), caption, fill=TEXT, font=font)
+        y += font_size + 14
+    for tid, label in labels.items():
+        state = states.get(tid, "searching")
+        visible = state == "tracking"
+        box = (12, y + 2, 12 + font_size, y + 2 + font_size)
+        if visible:
+            draw.rectangle(box, fill=id_color(tid))
+        else:
+            draw.rectangle(box, outline=id_color(tid), width=2)
+        draw.text((20 + font_size, y), f"{tid} {label}", fill=TEXT if visible else MUTED, font=font)
+        draw.text((20 + font_size, y + font_size + 3), STATE_TEXT.get(state, state), fill=MUTED, font=small)
+        y += 2 * font_size + 14
+    return np.asarray(panel)
 
 
-def draw_label(draw: ImageDraw.ImageDraw, xy: tuple[float, float], text: str, color, font) -> None:
+def draw_tag(draw: ImageDraw.ImageDraw, xy: tuple[float, float], text: str, color, font,
+             max_width: int | None = None) -> None:
+    """White text on a filled box in `color`, kept inside the image."""
+    l, t, r, b = draw.textbbox((0, 0), text, font=font)
     x, y = xy
-    l, t, r, b = draw.textbbox((x, y), text, font=font)
-    draw.rectangle((l - 2, t - 1, r + 2, b + 1), fill=color)
+    if max_width is not None:
+        x = min(x, max_width - (r - l) - 4)
+    x, y = max(x, 2), max(y, 1)
+    draw.rectangle((x - 2, y + t - 2, x + r + 2, y + b + 2), fill=color)
     draw.text((x, y), text, fill=(255, 255, 255), font=font)
 
 
@@ -71,7 +115,7 @@ def draw_boxes(
     boxes: list[tuple[np.ndarray, str, tuple[int, int, int], int]],
     font_size: int = 12,
 ) -> Image.Image:
-    """Draw (box, label, color, line width) tuples. Labels go above the box when there's room."""
+    """Draw (box, label, colour, line width) tuples. Labels go above the box when there's room."""
     draw = ImageDraw.Draw(image)
     font = _font(font_size)
     for box, label, color, width in boxes:
@@ -79,5 +123,15 @@ def draw_boxes(
         draw.rectangle((x0, y0, x1, y1), outline=color, width=width)
         if label:
             ty = y0 - font_size - 3 if y0 > font_size + 3 else y1 + 2
-            draw_label(draw, (x0, ty), label, color, font)
+            draw_tag(draw, (x0, ty), label, color, font, image.width)
     return image
+
+
+def render_track_frame(frame: np.ndarray, camera: str, frame_index: int, masks: dict[int, np.ndarray],
+                       states: dict[int, str], labels: dict[int, str]) -> np.ndarray:
+    """One frame of a pipeline output video: masks, tags and the status sidebar.
+
+    A target whose mask was emptied by output cleaning is shown as lost, so the sidebar always
+    agrees with what is drawn."""
+    shown = {tid: "tracking" if tid in masks else ("lost" if s == "tracking" else s) for tid, s in states.items()}
+    return annotate_frame(frame, masks, labels, caption=f"{camera} · frame {frame_index}", states=shown)

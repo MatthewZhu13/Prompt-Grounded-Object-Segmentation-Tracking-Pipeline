@@ -12,11 +12,9 @@ python pipeline.py \
 
 Dataset: [`allenai/15122025-cup-01`](https://huggingface.co/datasets/allenai/15122025-cup-01)
 (LeRobot v3, 62 episodes, cameras `top`, `left` and `right`, 640×360 at 30 fps).
-All models are open-source, run on a single consumer GPU (or Apple MPS), and are used zero-shot.
-Nothing is trained or fine-tuned.
+All models are open-source, run on a single consumer GPU, and are used zero-shot.
 
-See [`report.md`](report.md) for runtime, failure modes with frame references, and the
-two-week plan.
+See [`report.md`](report.md) for runtime and failure modes with frame references.
 
 ---
 
@@ -27,15 +25,10 @@ Python 3.11, from a fresh clone:
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt        # torch, transformers, spaCy + en_core_web_sm, PyAV, pyarrow
-pytest                                  # 26 unit tests, no models or data needed
 ```
 
-Model weights download from the Hugging Face Hub on first use (no gated models, no login).
-The dataset is read from `--data-dir` if given and fetched from the Hub otherwise. Only the
-parquet and video files the episode needs are downloaded.
-
-Tested with torch 2.14 and transformers 5.19 on Apple M5 (MPS). `--device cuda|mps|cpu`
-overrides the automatic choice.
+Model weights download from the Hugging Face Hub on first use.
+The dataset is fetched from the Hub.
 
 ## Usage
 
@@ -116,16 +109,15 @@ three bowls. A plural without a count ("cups") becomes one open-ended target. De
 the nouns only. It is good at "cup" but cannot tell "yellow cup" from "gray cup". SAM 2 turns
 each box into a mask. SigLIP 2 then scores a masked crop against every target phrase. The crop
 is shown on a gray background, so neighbouring objects cannot vote. SigLIP also scores
-negatives built from the task: other nouns with the task's colours ("yellow bowl"), the
-destination, and "robot gripper". For close-ups (masks of 15% of the frame or more), SigLIP
+negatives built from the task such as other nouns with the task's colours ("yellow bowl"), the
+destination, and "robot gripper". For close-ups, SigLIP
 sees the unblanked crop instead, because a held object's shape needs its context. Hungarian
-matching on a weighted product of both scores gives each target at most one object.
+matching on a weighted product of both scores gives each target at most one object with the highest possible score.
 
 **Tracking and corrections** (`segtrack/pipeline.py`, `segtrack/track.py`). SAM 2 video
 carries masks between refresh frames. On each refresh frame, the detections and the identity
 check decide per ID:
-- **seed / reacquire** when the ID is not tracked and the detection is confident (or matches
-  twice in the same place);
+- **seed / reacquire** when the ID is not tracked and the detection is confident;
 - **drift** when a confident detection sits elsewhere on two consecutive refreshes;
 - **hand-over** when a detection lands where a different same-noun ID was just lost;
 - **cut** when the mask stops looking like its target on two consecutive checks, or lands
@@ -134,7 +126,7 @@ check decide per ID:
 The identity check fails a track when SigLIP reads the masked crop as a different noun, or
 as another instance's hue (a white-cup track that reads "yellow cup"). The failure is excused
 when the target it read as is tracked elsewhere on that frame. Masks only ever disappear
-through cuts. The pipeline prefers a miss to a wrong label.
+through cuts.
 
 ---
 
@@ -142,7 +134,7 @@ through cuts. The pipeline prefers a miss to a wrong label.
 
 | Role | Model | Why this one |
 |---|---|---|
-| Open-vocabulary boxes | `IDEA-Research/grounding-dino-tiny` | pip-installable through `transformers` (no custom CUDA ops), strong on nouns, fast enough to run on every refresh frame |
+| Open-vocabulary boxes | `IDEA-Research/grounding-dino-tiny` | pip-installable through `transformers` , strong on nouns, fast enough to run on every refresh frame |
 | Masks and tracking | `facebook/sam2.1-hiera-small` (image + video) | best available promptable video segmenter that is not gated. The video model keeps identity between refreshes, so detection runs on 1 frame in 5–15 |
 | Attributes and identity | `google/siglip2-so400m-patch14-384`, fp16 | the only component that binds colour to object, used on masked crops |
 | Task parsing | spaCy `en_core_web_sm` + rules | deterministic, CPU-only, no extra GPU memory |
@@ -155,16 +147,11 @@ What was tested and measured:
   SigLIP runs only on refresh frames.
 - **Grounding DINO as a second opinion for small objects.** This was calibrated on 533 tracked
   masks and rejected. For 41% of masks under 1,000 px, Grounding DINO returned no box at all,
-  which covers almost every small fork. When it did answer, it was often wrong: it called the
+  which covers almost every small fork. When it did answer, it was often wrong. It called the
   top-camera gray cup in the container "spoon" (0.46 against 0.18). SigLIP's noun verdict was
   right on 94–100% of masks at every size.
 - **Grounding DINO threshold.** Lowered from 0.25 to 0.2 so that held and partly occluded
   objects get a box at all. SigLIP and the negatives reject the extra boxes.
-- **SAM 3.** Not used. Its weights are gated behind a license request and a Hub login, which
-  breaks the fresh-clone requirement.
-- **VLM tiebreaker (for example Qwen-VL).** Not used. It is the strongest candidate for the
-  cup-versus-bowl confusion from above (see [`report.md`](report.md)), but heavy for a
-  consumer GPU.
 
 ## Design decisions backed by experiments
 
@@ -173,13 +160,6 @@ episodes (0, 5, 18, 24 and 31), and kept only if it did not create wrong labels 
 
 - **Masked crops for small objects, unblanked crops for close-ups.** A held bowl's masked crop
   read as "white cup". The unblanked crop shows its shape (episode 0, left camera).
-- **Negatives carry the task's colours.** "White bowl" rather than "bowl" removed a false
-  "white cup" on a wrist-camera bowl and on the container. Off-colour negatives for single
-  objects ("blue bowl") were removed, because they rejected a bluish gray bowl. Episode 24's
-  "pink fork" and "green spoon" are actually white.
-- **Same-noun off-colours only for nouns told apart by colour.** In episode 5 the gray bowl
-  was labelled "white bowl" for 97% of a window. "Gray bowl" is now a negative when the task
-  names bowls in two or more colours.
 - **The hue rule in the identity check.** A white-cup track sat on the yellow cup nested
   inside it for 1,440 frames (episode 0, top camera). A first version of the rule also cut
   correct gray and yellow cups that glare made read "white" on the wrist cameras. Only

@@ -14,10 +14,10 @@ import torch
 
 from .assign import AssignConfig, AssignResult, assign
 from .attributes import AttributeScorer, build_negatives, context_crop, masked_crop
-from .boxes import containment, mask_to_box
+from .boxes import containment, mask_iou, mask_to_box
 from .detector import GroundingDetector
 from .device import get_device, synchronize
-from .parser import ParsedTask
+from .parser import ParsedTask, Target
 from .segmenter import BoxSegmenter
 
 OCCLUDERS = ["robot gripper"]
@@ -38,8 +38,9 @@ class FrameGrounding:
     negatives: list[str]
     result: AssignResult
     timings: dict[str, float] = field(default_factory=dict)
-    destination_masks: np.ndarray = field(default_factory=lambda: np.zeros((0, 0, 0), bool))  # (D, H, W)
-    embeddings: np.ndarray = field(default_factory=lambda: np.zeros((0, 0), np.float32))     # (C, E) SigLIP image
+    # (D, H, W) destination masks, and (C, E) SigLIP image embeddings of the candidates
+    destination_masks: np.ndarray = field(default_factory=lambda: np.zeros((0, 0, 0), bool))
+    embeddings: np.ndarray = field(default_factory=lambda: np.zeros((0, 0), np.float32))
 
     def mask_for(self, target_id: int) -> np.ndarray | None:
         m = next(m for m in self.result.matches if m.target_id == target_id)
@@ -75,26 +76,34 @@ class FrameGrounder:
         self._phrases = list(dict.fromkeys(t.phrase for t in parsed.targets))
         # Per target noun: its own phrases, and the negatives that share the noun ("gray bowl"
         # for a task with white and yellow bowls), see build_negatives.
-        self._own_phrases = {n: np.array([i for i, p in enumerate(self._phrases) if p == n or p.endswith(" " + n)])
-                             for n in parsed.nouns}
-        self._same_noun_neg = {n: np.array([i for i, p in enumerate(self.negatives) if p.endswith(" " + n)], int)
-                               for n in parsed.nouns}
+        self._own_phrases = {
+            n: np.array([i for i, p in enumerate(self._phrases) if p == n or p.endswith(" " + n)])
+            for n in parsed.nouns
+        }
+        self._same_noun_neg = {
+            n: np.array([i for i, p in enumerate(self.negatives) if p.endswith(" " + n)], int)
+            for n in parsed.nouns
+        }
         # Destinations ("the container") are queried too: they are in the scene by definition and
         # are the main thing target masks get confused with (cups seen inside a clear container).
         self._destinations = [d for d in parsed.destinations if d not in parsed.nouns]
         # The robot's own gripper is in every wrist-camera frame and touches what it grasps.
         self._occluders = [o for o in OCCLUDERS if o not in parsed.nouns]
         self.min_after_occluder = min_after_occluder
-        self.split_min_piece = split_min_piece      # fraction of the frame
-        self.split_max_cover = split_max_cover      # first object covers less than this of the mask → try a split
-        self.split_max_overlap = split_max_overlap  # second object overlaps the first less than this → split
+        # Splitting merged candidates (see _split_merged): pieces are at least split_min_piece of
+        # the frame; try a split when the first object covers less than split_max_cover of the
+        # mask, keep it when the second overlaps the first less than split_max_overlap.
+        self.split_min_piece = split_min_piece
+        self.split_max_cover = split_max_cover
+        self.split_max_overlap = split_max_overlap
         # Masks at least this fraction of the frame (an object held up to a wrist camera) get
         # the "is it something else, e.g. a bowl?" test on an unblanked crop instead of the
         # masked one. Only for such close-ups: on smaller objects the unblanked crop shows the
         # neighbours too (cups packed in the container read as "plate" / "mug").
         self.context_min_frac = context_min_frac
 
-    def verify(self, frame: np.ndarray, masks: dict[int, np.ndarray]) -> dict[int, tuple[bool, np.ndarray, str | None]]:
+    def verify(self, frame: np.ndarray, masks: dict[int, np.ndarray]
+               ) -> dict[int, tuple[bool, np.ndarray, tuple[int, ...] | None]]:
         """Does each tracked mask still look like its target? (SigLIP only, no detection.)
 
         A track fails if SigLIP's best target phrase for the masked crop is another target: a
@@ -114,10 +123,7 @@ class FrameGrounder:
         scores = self.scorer.score(emb, self._phrases + self.negatives)
         ctx = self._context_scores(frame, np.stack([masks[t] for t in tids]))
         n = len(self._phrases)
-        targets = self.parsed.targets
-        phrase_noun = [next(t.noun for t in targets if t.phrase == p) for p in self._phrases]
-        noun_of = {t.id: t.noun for t in targets}
-        by_id = {t.id: t for t in targets}
+        by_id = {t.id: t for t in self.parsed.targets}
         out = {}
         for k, tid in enumerate(tids):
             target, negative = scores[k, :n], scores[k, n:]
@@ -131,34 +137,40 @@ class FrameGrounder:
                 # cross-noun negatives are left to detection and the close-up test. Color
                 # survives small crops, so a same-noun negative ("gray bowl" against a "white
                 # bowl" track) still counts, judged against the track's own noun phrases.
-                noun = noun_of[tid]
+                noun = by_id[tid].noun
                 same, own = self._same_noun_neg[noun], self._own_phrases[noun]
                 negative_ok = not (len(same) and negative[same].max() > target[own].max())
-            best = int(target.argmax())
-            own, best_phrase = by_id[tid], self._phrases[best]
-            if phrase_noun[best] != own.noun:
-                read_as = tuple(t.id for t in targets if t.noun == phrase_noun[best])
-            elif k not in ctx and own.attributes and best_phrase not in (own.phrase, own.noun) \
-                    and {a for t in targets if t.phrase == best_phrase for a in t.attributes} - set(own.attributes) - ACHROMATIC:
-                # Same noun, another instance's hue: a "white cup" track that slid onto the yellow
-                # cup in the container reads "yellow cup". Only a reading that adds a hue counts
-                # (see ACHROMATIC), and never on close-ups, where wrist-camera glare decides the
-                # color. A bare-noun reading ("cup") claims nothing about color and passes.
-                read_as = tuple(t.id for t in targets if t.phrase == best_phrase)
-            else:
-                read_as = ()
+            read_as = self._read_as(by_id[tid], self._phrases[int(target.argmax())], close_up=k in ctx)
             out[tid] = (not read_as and negative_ok, emb[k], read_as if negative_ok and read_as else None)
         return out
+
+    def _read_as(self, own: Target, best_phrase: str, close_up: bool) -> tuple[int, ...]:
+        """IDs of the other targets a crop of `own` was read as, given SigLIP's best target
+        phrase for it; () if the reading is consistent with `own`."""
+        targets = self.parsed.targets
+        best_noun = next(t.noun for t in targets if t.phrase == best_phrase)
+        if best_noun != own.noun:
+            return tuple(t.id for t in targets if t.noun == best_noun)
+        if close_up or not own.attributes or best_phrase in (own.phrase, own.noun):
+            return ()
+        # Same noun, another instance's hue: a "white cup" track that slid onto the yellow cup
+        # in the container reads "yellow cup". Only a reading that adds a hue counts (see
+        # ACHROMATIC), and never on close-ups, where wrist-camera glare decides the colour.
+        # A bare-noun reading ("cup") claims nothing about colour and passes.
+        their_attributes = {a for t in targets if t.phrase == best_phrase for a in t.attributes}
+        if their_attributes - set(own.attributes) - ACHROMATIC:
+            return tuple(t.id for t in targets if t.phrase == best_phrase)
+        return ()
 
     def __call__(self, frame: np.ndarray) -> FrameGrounding:
         targets, nouns = self.parsed.targets, self.parsed.nouns
         timings: dict[str, float] = {}
 
         t0 = time.perf_counter()
-        det = self.detector(frame, nouns + self._destinations + self._occluders, threshold=self.cfg.dino_threshold)
+        queries = nouns + self._destinations + self._occluders
+        det = self.detector(frame, queries, threshold=self.cfg.dino_threshold)
         synchronize(self.device)
         timings["detector"] = time.perf_counter() - t0
-        
 
         t0 = time.perf_counter()
         masks, quality = self.segmenter(frame, det.boxes)
@@ -199,7 +211,7 @@ class FrameGrounder:
                 if masks[i].sum() < self.min_after_occluder * before:
                     cand[i] = False         # the candidate was mostly gripper
                     continue
-            if any(_iou(masks[i], d) > self.destination_iou for d in dest_masks):
+            if any(mask_iou(masks[i], d) > self.destination_iou for d in dest_masks):
                 cand[i] = False             # the candidate is the destination itself
         # Relabeled boxes: Grounding DINO found an object there but named it wrongly, so its
         # score for the target nouns is low by construction. Use its overall confidence that an
@@ -241,8 +253,8 @@ class FrameGrounder:
         result = assign(targets, dino, siglip, neg_scores, self.cfg)
         timings["assign"] = time.perf_counter() - t0
 
-        return FrameGrounding(boxes, masks, quality, dino, siglip, neg_scores, self.negatives, result, timings,
-                              destination_masks=dest_masks, embeddings=emb)
+        return FrameGrounding(boxes, masks, quality, dino, siglip, neg_scores, self.negatives, result,
+                              timings, destination_masks=dest_masks, embeddings=emb)
 
     def _context_scores(self, frame: np.ndarray, masks: np.ndarray) -> dict[int, np.ndarray]:
         """{index: SigLIP scores (phrases + negatives) on the unblanked crop} for close-up masks."""
@@ -278,7 +290,8 @@ class FrameGrounder:
             for (i, _), piece in zip(firsts, pieces):
                 a = piece & masks[i]
                 rest = masks[i] & ~a
-                if a.sum() >= min_area and rest.sum() >= min_area and a.sum() < self.split_max_cover * masks[i].sum():
+                big_enough = a.sum() >= min_area and rest.sum() >= min_area
+                if big_enough and a.sum() < self.split_max_cover * masks[i].sum():
                     seconds.append((i, a, _interior_point(rest)))
             if seconds:
                 pieces = self.segmenter.points(frame, [p for _, _, p in seconds])
@@ -323,7 +336,3 @@ def _interior_point(mask: np.ndarray) -> tuple[int, int]:
     y, x = np.unravel_index(int(d.argmax()), d.shape)
     return int(x), int(y)
 
-
-def _iou(a: np.ndarray, b: np.ndarray) -> float:
-    union = np.logical_or(a, b).sum()
-    return float(np.logical_and(a, b).sum() / union) if union else 0.0

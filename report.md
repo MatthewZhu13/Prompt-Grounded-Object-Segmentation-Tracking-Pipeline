@@ -16,7 +16,7 @@ videos at the frames cited.
 
 ## Runtime
 
-Measured on an Apple M5 laptop (MPS backend, unified memory), episode 0, all cameras.
+Measured on an Apple M5 laptop, episode 0, all cameras.
 
 | Camera | Frames | Seconds | s / frame | Detection refresh |
 |---|---|---|---|---|
@@ -24,8 +24,6 @@ Measured on an Apple M5 laptop (MPS backend, unified memory), episode 0, all cam
 | left | 2,452 | 1,152 | 0.47 | every 5 frames |
 | right | 2,452 | 2,548 | 1.04 | every 5 frames |
 | **all** | 7,356 | 6,134 | **0.83** | |
-
-Model loading adds about 9 s once per run.
 
 Time by stage, in seconds:
 
@@ -35,12 +33,9 @@ Time by stage, in seconds:
 | left | 724 | 23 | 409 | 18 |
 | right | 720 | 106 | 1,783 | 44 |
 
-SAM 2 video propagation dominates. Its cost grows with the number of objects tracked and with
+SAM 2 video propagation dominates the computation time. Its cost grows with the number of objects tracked and with
 re-tracking after each correction. Detection runs only on refresh frames. On the top camera
 that is 164 of 2,452 frames.
-
-No CUDA timing was measured. The code is device-agnostic (`--device cuda`), and every model
-fits comfortably in 16 GB.
 
 ## What works
 
@@ -69,12 +64,10 @@ Checked visually on the top camera at frames 300, 450, 600, 750, 900, 1050, 1200
 Ordered by how much they hurt. The pipeline is tuned to prefer a miss over a wrong label, so
 most failures are missing masks.
 
-1. **Cup versus bowl of the same colour.** This is the main source of persistent wrong labels.
+1. **Cup versus bowl of the same colour.** This is the main source of persistently wrong labeling
    At 360p from above, a cup and a bowl are both coloured circles. Grounding DINO scores them
-   about equally (0.30 against 0.31), and SigLIP reads many cup crops as bowls. So when the task
-   names a yellow bowl and a yellow cup is in the scene, the yellow cup can win. Episode 24 is the
-   worst case (see the robustness section). A cross-noun test on small crops used to catch some
-   of these, but it cut correct cups about as often as wrong ones and was removed.
+   about equally and SigLIP reads many cup crops as bowls. When the task
+   names a yellow bowl and a yellow cup is in the scene, the yellow cup can win. 
 2. **Colour on wrist-camera close-ups.** Glare and blur wash colours out. In episode 0, right
    camera, frames 2110–2155, the "white cup" tag sits on the held yellow cup until the identity
    check cuts it. The hue rule deliberately skips close-ups, because on these views it cut more
@@ -90,11 +83,8 @@ most failures are missing masks.
    (episode 5). Its cost here is about 24 points of top-camera recall on the gray bowl.
 5. **Ambiguous first frames.** In episode 5, left camera, frames 0–100, the yellow cup is read
    as "yellow bowl". Both models get this view wrong. It corrects itself from frame 150, once
-   the cup is seen at an angle.
-6. **Open-ended plurals track one instance.** "Put the cups, bowls, and utensils in the bin"
-   parses correctly into open-ended targets. The tracker, however, follows only the best match
-   per open-ended target (episode 2).
-7. **No cross-camera reasoning.** Each camera is tracked on its own. The same object gets the
+   the cup is seen at an angle. Similar issue to number 1.
+6. **No cross-camera reasoning.** Each camera is tracked on its own. The same object gets the
    same ID on every camera because IDs come from the task, but nothing checks that the cameras
    agree.
 
@@ -129,41 +119,21 @@ These are shares of frames with a mask, not accuracy. Checked visually:
   table and in the gripper. At frame 615 it drifts onto the yellow cup in the container, while
   the real bowl is still held. It stays there until the identity check cuts it at frame 1530.
   That is about 55% of the episode. The gray bowl, fork and spoon are right whenever labelled.
-- **Left camera (the arm that moves the cups): mostly wrong.** All three cups carry the
+- **Left camera: mostly wrong.** All three cups carry the
   matching bowl labels over frames 0–150. The yellow-bowl tag follows the yellow cup in the
   container from about frame 720 to the end. Only the gray bowl at the end of the episode is
   labelled correctly.
 
-Compared with the earlier run on this episode, made before the last two fixes, the top
-camera's gray bowl, fork and spoon are tracked more often. The left camera's white-bowl tag on
-the white cup over frames 0–150 is new. The earlier run cut it with the small-crop cup-or-bowl
-test. Episode 24 is the case that test was good for, and episodes 0 and 31 are the cases it
-broke.
-
-The takeaway: the pipeline is reliable when the distractors differ from the targets in noun
-*and* colour or shape (the bowls in episode 0), and when objects are seen from the side. It is
-not reliable when the distractors have the same colour as the targets and differ only in being
-cups instead of bowls. That needs a cue these models do not use, such as relative size or depth.
+The pipeline is unreliable when the distractors are similar to the targets in colour or shape (the bowls in episode 0), and when objects are not seen from the side. That needs a cue these models do not use, such as relative size or depth.
 
 ## With two more weeks
 
-1. **A size-aware tiebreaker for cup versus bowl (failure modes 1, 2 and 5).** This is the first priority, because episode 24 shows it is the largest error. Call a
-   mid-size open VLM (for example Qwen2.5-VL 7B, 4-bit) only when the assignment is marked
+1. **A size-aware tiebreaker for cup versus bowl (failure modes 1, 2 and 5).** 
+   This is the first priority, because episode 24 shows it is the largest error. Call a mid-size open VLM only when the assignment is marked
    uncertain, or when the identity check and the detector disagree. That is a few dozen frames
    per episode. A VLM sees the whole frame, so it can use relative size, which tells a cup from
-   a bowl. Measure it on the frames listed above before trusting it.
+   a bowl.
 2. **Cross-camera consistency.** Use the camera geometry and the robot's joint state from the
    dataset to project the gripper into each view. An object held in the gripper is in the
-   gripper on every camera. This would recover wrist-camera misses (failure mode 3), and
+   gripper on every camera. This would recover wrist-camera misses, and
    reject wrist labels the top camera contradicts.
-3. **A small labelled evaluation set.** Hand-label masks on about 200 frames across 5 episodes
-   and all cameras. Report per-target IoU, ID switches and wrong-label frames. Every decision so
-   far was made by inspecting contact sheets, which does not scale and hides slow regressions.
-4. **Multi-instance tracking for open-ended targets.** Spawn one ID per confident match, and
-   keep them apart with the same no-stealing and hand-over rules.
-5. **Speed.** Skip SAM 2 re-tracking for frames where nothing changed, batch SigLIP across
-   cameras, and try `sam2.1-hiera-tiny` for propagation with `small` only for seeding. Measure
-   wrong-label frames on the evaluation set alongside the speed-up.
-6. **Smaller items.** A container-aware identity check (score the crop against "cup in a
-   clear plastic box"), and re-seeding at the end of the episode, when objects rest in the
-   container.

@@ -8,7 +8,7 @@ Writes to <output-dir>/episode_<NNN>/:
     masks.parquet      one row per (camera, frame_index, track_id); RLE masks, see README for schema
     targets.json       parsed task: track id → phrase, noun, attributes
     stats.json         runtime (sec/frame per camera and stage), device, visibility per track
-    events.jsonl       every seed / re-acquisition / drift correction, with frame and track id
+    events.jsonl       every tracker decision (seed, re-acquire, drift, cut...), with frame and track id
 """
 
 from __future__ import annotations
@@ -29,6 +29,20 @@ def parse_refresh(spec: str) -> dict[str, int]:
     return out
 
 
+def quiet_libraries() -> None:
+    """Hide Hugging Face loading bars and config warnings, which bury the progress lines."""
+    import warnings
+
+    from huggingface_hub.utils import disable_progress_bars
+    from transformers.utils import logging as hf_logging
+
+    hf_logging.set_verbosity_error()
+    hf_logging.disable_progress_bar()
+    disable_progress_bars()
+    warnings.filterwarnings("ignore", category=UserWarning)
+    warnings.filterwarnings("ignore", category=FutureWarning)
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--task", required=True, help="natural-language instruction naming the objects")
@@ -45,7 +59,10 @@ def main() -> None:
                    help="re-detection interval per camera, e.g. 'top=15,left=5' (others: --default-refresh)")
     p.add_argument("--default-refresh", type=int, default=5)
     p.add_argument("--no-video", action="store_true", help="skip writing overlay videos")
+    p.add_argument("--verbose", action="store_true", help="show model-loading progress bars and warnings")
     args = p.parse_args()
+    if not args.verbose:
+        quiet_libraries()
 
     cfg = PipelineConfig(
         chunk_size=args.chunk_size,
