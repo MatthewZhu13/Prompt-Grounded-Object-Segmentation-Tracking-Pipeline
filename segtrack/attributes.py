@@ -46,14 +46,27 @@ class AttributeScorer:
         bias, sigmoid), split so phrase embeddings are computed once per phrase list: the
         phrases are fixed for a run while crops change every frame.
         """
-        if not crops or not phrases:
-            return np.zeros((len(crops), len(phrases)))
-        text = self._text_embeddings(tuple(phrases))
+        return self.score(self.embed(crops), phrases)
+
+    @torch.no_grad()
+    def embed(self, crops: list[Image.Image]) -> np.ndarray:
+        """(len(crops), D) unit-norm image embeddings (also used as appearance memory)."""
+        if not crops:
+            return np.zeros((0, self.model.config.vision_config.hidden_size), np.float32)
         pixels = self.processor(images=crops, return_tensors="pt")["pixel_values"].to(self.device, self.dtype)
         image = self.model.vision_model(pixel_values=pixels).pooler_output
         image = image / image.norm(dim=-1, keepdim=True)
-        logits = image @ text.T * self.model.logit_scale.exp() + self.model.logit_bias
-        return torch.sigmoid(logits).float().cpu().numpy()
+        return image.float().cpu().numpy()
+
+    @torch.no_grad()
+    def score(self, embeddings: np.ndarray, phrases: list[str]) -> np.ndarray:
+        """Sigmoid match scores for precomputed image embeddings (see `embed`)."""
+        if not len(embeddings) or not phrases:
+            return np.zeros((len(embeddings), len(phrases)))
+        text = self._text_embeddings(tuple(phrases)).float()
+        image = torch.from_numpy(embeddings).to(self.device)
+        logits = image @ text.T * self.model.logit_scale.exp().float() + self.model.logit_bias.float()
+        return torch.sigmoid(logits).cpu().numpy()
 
     def _text_embeddings(self, phrases: tuple[str, ...]) -> torch.Tensor:
         if phrases not in self._text_cache:
@@ -64,11 +77,13 @@ class AttributeScorer:
         return self._text_cache[phrases]
 
 
-def masked_crop(image: np.ndarray, mask: np.ndarray, pad: float = 0.15, background: int = 128) -> Image.Image:
+def masked_crop(image: np.ndarray, mask: np.ndarray, pad: float = 0.15, background: int = 128,
+                blank_outside: bool = True) -> Image.Image:
     """Square crop around `mask`, with pixels outside the mask set to `background`.
 
     Blanking the background stops neighbouring objects and the table from influencing the
     color judgement; squaring avoids distortion when SigLIP resizes to its input size.
+    `blank_outside=False` keeps the surroundings (see `context_crop`).
     """
     box = mask_to_box(mask)
     h, w = mask.shape
@@ -81,11 +96,22 @@ def masked_crop(image: np.ndarray, mask: np.ndarray, pad: float = 0.15, backgrou
     s = int(round(side))
 
     canvas = np.full((s, s, 3), background, dtype=np.uint8)
-    src = np.where(mask[..., None], image, background).astype(np.uint8)
+    src = np.where(mask[..., None], image, background).astype(np.uint8) if blank_outside else image
     ix0, iy0 = max(sx0, 0), max(sy0, 0)
     ix1, iy1 = min(sx0 + s, w), min(sy0 + s, h)
     canvas[iy0 - sy0:iy1 - sy0, ix0 - sx0:ix1 - sx0] = src[iy0:iy1, ix0:ix1]
     return Image.fromarray(canvas)
+
+
+def context_crop(image: np.ndarray, mask: np.ndarray, pad: float = 0.15) -> Image.Image:
+    """Square crop around `mask` without blanking: for telling a cup from a bowl up close.
+
+    On a wrist-camera close-up the mask's outline alone is ambiguous (a bowl's rim and a cup's
+    rim, both cut off by the frame edge); the unblanked crop shows the depth of the inside and
+    how the object sits, and SigLIP reads cup vs bowl from it far better (on this episode's
+    close-ups: 74% vs 48% of bowl crops read as bowl, 13% vs 29% of cup crops wrongly so).
+    """
+    return masked_crop(image, mask, pad=pad, blank_outside=False)
 
 
 def build_negatives(parsed: ParsedTask) -> list[str]:
@@ -101,4 +127,16 @@ def build_negatives(parsed: ParsedTask) -> list[str]:
     # would let "white cup" win on a white bowl).
     attributes = list(dict.fromkeys(" ".join(t.attributes) for t in parsed.targets if t.attributes))
     negatives += [f"{a} {d}" for d in distractors for a in attributes]
+    # Same noun, a color the task uses only for other nouns ("gray bowl" when the task names
+    # white and yellow bowls and a gray cup). Only for nouns the task tells apart by color
+    # (two or more attributed instances): there color is decisive, so a third color is a
+    # different object. A noun with one instance keeps color descriptive, not decisive (a
+    # pink fork under glare may read white).
+    by_noun: dict[str, set[str]] = {}
+    for t in parsed.targets:
+        if t.attributes:
+            by_noun.setdefault(t.noun, set()).add(" ".join(t.attributes))
+    for noun, used in by_noun.items():
+        if len(used) >= 2:
+            negatives += [f"{a} {noun}" for a in attributes if a not in used]
     return [n for n in dict.fromkeys(negatives) if n not in target_phrases and n not in target_nouns]

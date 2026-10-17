@@ -2,7 +2,8 @@
 
 Objects seeded on the same frame share one SAM 2 session, which propagates
   forward  from the seed frame to the end of the chunk, and
-  backward from the seed frame to the chunk start (the pipeline is offline, so this is allowed).
+  backward from the seed frame as far as the caller asks (to fill frames before the object was
+           detected; the pipeline is offline, so this is allowed).
 SAM 2's video model cannot start a forward pass before an object's first prompt, so objects
 seeded on different frames get separate sessions; that only repeats the cheap per-frame image
 encoding, since the dominant cost (memory attention) is per object anyway. Callers should only
@@ -45,12 +46,14 @@ class VideoTracker:
     def track(
         self,
         frames: np.ndarray,
-        prompts: dict[int, tuple[int, np.ndarray]],
+        prompts: dict[int, tuple],
         backward: bool = True,
     ) -> tuple[list[FrameMasks], list[FrameScores]]:
         """Track objects through `frames` (N, H, W, 3).
 
-        prompts: track id → (frame index within the chunk, seed mask).
+        prompts: track id → (seed frame, seed mask) or (seed frame, seed mask, back_to), where
+            back_to is the earliest frame the backward pass must reach (None: no backward pass).
+            Without back_to, the backward pass runs to the chunk start (if `backward`).
         Returns per-frame masks and presence scores, indexed like `frames`.
         """
         masks: list[FrameMasks] = [{} for _ in range(len(frames))]
@@ -59,8 +62,13 @@ class VideoTracker:
             return masks, scores
 
         by_frame: dict[int, list[tuple[int, np.ndarray]]] = defaultdict(list)
-        for tid, (f, mask) in prompts.items():
+        back_to: dict[int, list[int]] = defaultdict(list)
+        for tid, prompt in prompts.items():
+            f, mask = prompt[0], prompt[1]
+            stop = prompt[2] if len(prompt) > 2 else (0 if backward else None)
             by_frame[f].append((tid, mask))
+            if stop is not None and stop < f:
+                back_to[f].append(stop)
 
         for seed, items in sorted(by_frame.items()):
             session = self.processor.init_video_session(
@@ -71,17 +79,20 @@ class VideoTracker:
                 inference_session=session, frame_idx=seed,
                 obj_ids=[tid for tid, _ in items], input_masks=[m for _, m in items],
             )
-            self._propagate(session, seed, False, lambda f: True, masks, scores)
-            if backward and seed > 0:
-                self._propagate(session, seed, True, lambda f, s=seed: f < s, masks, scores)
+            self._propagate(session, seed, False, None, lambda f: True, masks, scores)
+            if back_to[seed]:
+                # Backward only as far as some object in this group needs filling.
+                stop = min(back_to[seed])
+                self._propagate(session, seed, True, seed - stop, lambda f, s=seed: f < s, masks, scores)
         return masks, scores
 
     def _propagate(
-        self, session, start: int, reverse: bool, keep: Callable[[int], bool],
+        self, session, start: int, reverse: bool, max_frames: int | None, keep: Callable[[int], bool],
         masks: list[FrameMasks], scores: list[FrameScores],
     ) -> None:
         size = [[session.video_height, session.video_width]]
-        for out in self.model.propagate_in_video_iterator(session, start_frame_idx=start, reverse=reverse):
+        for out in self.model.propagate_in_video_iterator(session, start_frame_idx=start, reverse=reverse,
+                                                          max_frame_num_to_track=max_frames):
             f = out.frame_idx
             if not keep(f):
                 continue

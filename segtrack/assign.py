@@ -6,7 +6,8 @@ For candidate c and target t:
        c's best SigLIP target phrase has t's noun                   — does SigLIP agree on the noun?
        c's best negative does not beat its best target phrase by     — is it clearly something else?
          more than neg_ratio×
-       bare nouns only: SigLIP score ≥ plain_siglip_threshold       — SigLIP confirms the noun
+       bare nouns only: SigLIP ≥ plain_siglip_threshold and         — both models must be surer when
+                        Grounding DINO ≥ plain_dino_threshold          there is no attribute to check
      SigLIP's absolute scores are not comparable across phrases (a real fork scores ~0.9, a
      real white cup seen in a gripper ~0.02), so for targets with attributes SigLIP is only
      used relatively: noun agreement here, and choosing between instances in step 3. For bare
@@ -40,6 +41,7 @@ EPS = 1e-6
 class AssignConfig:
     dino_threshold: float = 0.2
     plain_siglip_threshold: float = 0.05    # applies only to targets without attributes
+    plain_dino_threshold: float = 0.3       # bare nouns: Grounding DINO carries the decision (w_plain), so it must be surer
     w_attr: float = 0.3         # Grounding DINO weight for targets with attributes
     w_plain: float = 0.8        # Grounding DINO weight for bare nouns
     neg_ratio: float = 1.0      # reject a crop if a negative phrase beats its best target by this factor
@@ -92,8 +94,9 @@ def assign(
     best_noun = nouns[siglip.argmax(axis=1)] if C else np.array([], dtype=nouns.dtype)
     noun_agrees = best_noun[:, None] == nouns[None, :]
     siglip_ok = has_attrs[None, :] | (siglip >= cfg.plain_siglip_threshold)
+    dino_ok = dino >= np.where(has_attrs, cfg.dino_threshold, cfg.plain_dino_threshold)[None, :]
 
-    allowed = (dino >= cfg.dino_threshold) & noun_agrees & siglip_ok & ~rejected[:, None]
+    allowed = dino_ok & noun_agrees & siglip_ok & ~rejected[:, None]
     w = np.where(has_attrs, cfg.w_attr, cfg.w_plain)
     composite = w * np.log(np.maximum(dino, EPS)) + (1 - w) * np.log(np.maximum(siglip, EPS))
     composite = np.where(allowed, composite, -np.inf)
